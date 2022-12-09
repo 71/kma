@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import logging
 import os
 
@@ -70,29 +71,103 @@ text_dataset = Dataset(examples, named_fields)
 text_iter = torchtext.data.BucketIterator(text_dataset, batch_size=5, shuffle=False)
 
 outputs = []
+sentsit = iter(sents)
 with torch.no_grad():
     for t in text_iter:
         decoder_outputs, tagger_outputs, others = model.infer(t.word[0].to(device))
+
         for n in range(len(others['length'])):
             length = others['length'][n]
             tgt_id_seq = [others['sequence'][di][n].item() for di in range(length)]
             tag_id_seq = [tagger_outputs[n][di].item() for di in range(length)]
 
+            sent = next(sentsit)
             result = []
-            for i, (tgt, pos) in enumerate(zip(tgt_id_seq, tag_id_seq)):
-                if tgt == WORD.vocab.stoi[WORD.unk_token] and config['replace_unk']:
-                    _, idx = others['attention_score'][i][n].max(1)
-                    attn_idx = idx.item() - 1
-                    if attn_idx < 0 or attn_idx >= len(t.raw[n]):
-                        continue
 
-                    result.append(t.raw[n][attn_idx] + "/" + POS_TAG.vocab.itos[pos])
+            for i, (tgt, pos) in enumerate(zip(tgt_id_seq, tag_id_seq)):
+                pos = POS_TAG.vocab.itos[pos]
+                lex = WORD.vocab.itos[tgt]
+
+                _, idx = others['attention_score'][i][n].max(1)
+                attn_idx = idx.item() - 1
+                raw = t.raw[n][attn_idx] if 0 <= attn_idx < len(t.raw[n]) else None
+                text = ""
+
+                if pos == "<blank>" or lex == "<blank>":
+                    # Skip whitespace.
+                    s = sent
+                    sent = sent.lstrip()
+                    text = s[:len(s) - len(sent)]
+                elif raw and sent.startswith(raw):
+                    # Take raw string.
+                    text = raw
+                    sent = sent[len(raw):]
+                elif raw and result and result[-1][0] == raw and result[-1][1] == "<tok>":
+                    # Move text from (previous) raw token to normal (current) token.
+                    result[-1] = "", *result[-1][1:]
+                    text = raw
+                elif raw == lex and result and result[-1][0] == raw and result[-1][0] != result[-1][1]:
+                    # Sometimes the `raw` value gets assigned too eagerly, but here we found a better
+                    # match so we're assigning it here.
+                    result[-1] = "", *result[-1][1:]
+                    text = raw
+
+                if tgt == WORD.vocab.stoi[WORD.unk_token] and config['replace_unk']:
+                    result.append((text, raw, pos))
                 else:
-                    result.append(WORD.vocab.itos[tgt] + "/" + POS_TAG.vocab.itos[pos])
+                    result.append((text, lex, pos))
+
+            if sent.rstrip() and not sent.rstrip(" .?\n"):
+                result.append((sent.rstrip(), sent.rstrip(), "SF"))
+            else:
+                assert len(sent.rstrip()) == 0, f"{sent!r} vs {result}"
 
             outputs.append(result)
 
-with io.open(args.output_file, 'w', encoding='utf-8') as f:
-    for output in outputs:
-        f.write(' '.join('{}/{}'.format(*mt) for mt in syllable_to_eojeol(output)) + '\n')
+def _merge(tokens: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """Merges subsequent tokens that represent the same POS."""
+    result = []
+    curr_token, curr_raw, curr_pos = "", "", None
 
+    for raw, lex, pos in tokens + [("", "<eos>", "<eos>")]:  # Make sure we end the loop correctly.
+
+        # End of sentence.
+        if "<eos>" in (lex, pos):
+            if not curr_token:
+                continue
+
+            result.append((curr_raw, curr_token, curr_pos))
+            curr_token, curr_raw, curr_pos = "", "", None
+            continue
+
+        # Blank characters.
+        if lex in ("<blank>", "<tok>"):
+            if curr_token:
+                result.append((curr_raw, curr_token, curr_pos))
+                curr_token, curr_raw, curr_pos = "", "", None
+
+            if lex == "<tok>" and raw:
+                curr_raw += raw
+            elif lex == "<blank>":
+                result.append((raw, "<blank>", "<blank>"))
+
+            continue
+
+        curr_raw += raw
+        curr_token += lex
+        curr_pos = pos if curr_pos is None else curr_pos
+
+    if curr_raw in ".?":
+        result.append((curr_raw, curr_raw, "SF"))
+
+    return result
+
+with io.open(args.output_file, 'w', encoding='utf-8') as f:
+    prefix = "[\n"
+
+    for output in outputs:
+        f.write(prefix)
+        prefix = ",\n"
+        json.dump(_merge(output), f, ensure_ascii=False)
+
+    f.write("\n]")
