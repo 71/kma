@@ -72,6 +72,9 @@ text_iter = torchtext.data.BucketIterator(text_dataset, batch_size=5, shuffle=Fa
 
 outputs = []
 sentsit = iter(sents)
+
+print_iters = len(examples) // 100
+
 with torch.no_grad():
     for t in text_iter:
         decoder_outputs, tagger_outputs, others = model.infer(t.word[0].to(device))
@@ -119,10 +122,14 @@ with torch.no_grad():
 
             if sent.rstrip() and not sent.rstrip(" .?\n"):
                 result.append((sent.rstrip(), sent.rstrip(), "SF"))
-            else:
-                assert len(sent.rstrip()) == 0, f"{sent!r} vs {result}"
+            elif len(sent.rstrip()) != 0:
+                print(f"cannot fully parse sentence: {sent!r} vs {result}")
+                result = []
 
             outputs.append(result)
+
+            if len(examples) > 1000 and len(outputs) % print_iters == 0:
+                print("{:.1f}%".format(len(outputs) / len(examples) * 100))
 
 def _merge(tokens: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
     """Merges subsequent tokens that represent the same POS."""
